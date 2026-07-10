@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from './lib/supabase';
+import { WebView } from 'react-native-webview';
 import * as NavigationBar from 'expo-navigation-bar';
 import * as Notifications from 'expo-notifications';
 import { StatusBar } from 'expo-status-bar';
@@ -292,8 +293,9 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
   const[lescoSessionId,setLescoSessionId]=useState<string|null>(null);
   const[lescoErr,setLescoErr]=useState('');
   const[captchaCode,setCaptchaCode]=useState('');
+  const[lescoWebViewUri,setLescoWebViewUri]=useState<string|null>(null);
 
-  const reset=()=>{ setUseTemplate(true);setSelectedTpl(null);setName('');setType('fixed');setCategory('');setAmount('');setDate(todayStr());setSelectedMembers([]);setSplitInputs([]);setReminderDays(3);setLescoRef(null);setLescoState('idle');setLescoCaptchaImg(null);setLescoSessionId(null);setLescoErr('');setCaptchaCode(''); };
+  const reset=()=>{ setUseTemplate(true);setSelectedTpl(null);setName('');setType('fixed');setCategory('');setAmount('');setDate(todayStr());setSelectedMembers([]);setSplitInputs([]);setReminderDays(3);setLescoRef(null);setLescoState('idle');setLescoCaptchaImg(null);setLescoSessionId(null);setLescoErr('');setCaptchaCode('');setLescoWebViewUri(null); };
   useEffect(()=>{ if(visible) reset(); },[visible]);
 
   const applyTemplate=(tpl:Template)=>{
@@ -304,108 +306,80 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
     } else { setLescoRef(null);setLescoState('idle'); }
   };
 
-  // Parse bill amount/details from raw PITC HTML using text scan (no cheerio needed)
-  const parsePitcHtml=(html:string)=>{
-    // Strip script/style blocks entirely so their content doesn't pollute the text scan
-    const stripped=html.replace(/<script[\s\S]*?<\/script>/gi,' ').replace(/<style[\s\S]*?<\/style>/gi,' ');
-    const txt=stripped.replace(/<[^>]+>/g,' ').replace(/&nbsp;/gi,' ').replace(/&#[0-9]+;/g,' ').replace(/\s+/g,' ');
+  // JS injected into WebView after page loads — waits for PITC's JS to render bill,
+  // then posts the page text back to React Native.
+  const LESCO_EXTRACT_JS=`
+    (function poll(attempts) {
+      var text = document.body ? document.body.innerText : '';
+      var hasData = text.toUpperCase().indexOf('AMOUNT PAYABLE') !== -1 ||
+                    text.toUpperCase().indexOf('AMOUNT DUE') !== -1 ||
+                    text.toUpperCase().indexOf('NET PAYABLE') !== -1;
+      if (hasData || attempts <= 0) {
+        window.ReactNativeWebView.postMessage(JSON.stringify({ text: text, done: true }));
+      } else {
+        setTimeout(function() { poll(attempts - 1); }, 800);
+      }
+    })(10);
+    true;
+  `;
+
+  const parsePitcText=(text:string)=>{
+    const t=text.replace(/\s+/g,' ');
     const after=(label:string)=>{
-      const idx=txt.toUpperCase().indexOf(label.toUpperCase());
+      const idx=t.toUpperCase().indexOf(label.toUpperCase());
       if(idx===-1) return null;
-      return txt.slice(idx+label.length,idx+label.length+120).trim().split(/\s{2,}/)[0].trim()||null;
+      return t.slice(idx+label.length,idx+label.length+120).trim().split(/\s{2,}/)[0].trim()||null;
     };
     const parseAmt=(v:string|null)=>parseInt((v||'').replace(/[^0-9]/g,''),10)||0;
     const get=(...labels:string[])=>{ for(const l of labels){const v=after(l);if(v&&v.length<80)return v;} return null; };
-
-    // Try all known PITC/LESCO label variants for the payable amount
     const amtRaw=get(
-      'AMOUNT PAYABLE WITHIN DUE DATE:','AMOUNT PAYABLE WITHIN DUE DATE',
-      'WITHIN DUE DATE:','WITHIN DUE DATE',
-      'PAYABLE WITHIN DUE DATE:','PAYABLE WITHIN DUE DATE',
-      'AMOUNT PAYABLE:','AMOUNT PAYABLE',
-      'NET PAYABLE:','NET PAYABLE',
-      'NET AMOUNT:','NET AMOUNT',
-      'TOTAL PAYABLE:','TOTAL PAYABLE',
-      'TOTAL AMOUNT:','TOTAL AMOUNT',
-      'AMOUNT DUE:','AMOUNT DUE',
-      'PAYABLE AMOUNT:','PAYABLE AMOUNT',
-      'DUE AMOUNT:','DUE AMOUNT',
+      'AMOUNT PAYABLE WITHIN DUE DATE','WITHIN DUE DATE',
+      'PAYABLE WITHIN DUE DATE','AMOUNT PAYABLE',
+      'NET PAYABLE','NET AMOUNT','TOTAL PAYABLE','TOTAL AMOUNT',
+      'AMOUNT DUE','PAYABLE AMOUNT','DUE AMOUNT',
     );
     let amountWithinDueDate=parseAmt(amtRaw);
-
-    // Fallback: scan for any Rs / PKR followed by a number, take the first one ≥ 100
     if(!amountWithinDueDate){
-      const rsMatches=txt.match(/(?:RS|PKR)\.?\s*([0-9,]+)/gi)??[];
-      for(const m of rsMatches){
-        const n=parseAmt(m);
-        if(n>=100){amountWithinDueDate=n;break;}
-      }
-    }
-    // Last resort: grab standalone numbers ≥ 500 (no electricity bill is under Rs 500)
-    if(!amountWithinDueDate){
-      const nums=txt.match(/\b([0-9]{3,7})\b/g)??[];
+      const nums=t.match(/\b([0-9]{3,7})\b/g)??[];
       for(const n of nums){const v=parseInt(n,10);if(v>=500&&v<=999999){amountWithinDueDate=v;break;}}
     }
-
     return {
-      customerName:        get('CUSTOMER NAME:','CUSTOMER NAME','CONSUMER NAME:','CONSUMER NAME','NAME:')??'Unknown',
-      dueDate:             get('DUE DATE:','DUE DATE','LAST DATE:','LAST DATE','PAYABLE DATE:','PAYMENT DUE DATE:')??'Unknown',
+      customerName:        get('CUSTOMER NAME','CONSUMER NAME','NAME')??'Unknown',
+      dueDate:             get('DUE DATE','LAST DATE','PAYABLE DATE','PAYMENT DUE DATE')??'Unknown',
       amountWithinDueDate,
-      amountAfterDueDate:  parseAmt(get('AMOUNT PAYABLE AFTER DUE DATE:','AFTER DUE DATE:','AFTER DUE DATE','AMOUNT AFTER DUE DATE:')),
-      lastBillMonth:       get('BILL MONTH:','BILLING MONTH:','BILLING MONTH','MONTH:','BILL PERIOD:')??'Unknown',
-      _debug: txt.slice(0,400), // temporary — helps diagnose label mismatches
+      amountAfterDueDate:  parseAmt(get('AMOUNT PAYABLE AFTER DUE DATE','AFTER DUE DATE')),
+      lastBillMonth:       get('BILL MONTH','BILLING MONTH','MONTH','BILL PERIOD')??'Unknown',
     };
   };
 
-  const lescoFetch=async()=>{
+  const lescoFetch=()=>{
     if(!lescoRef) return;
     setLescoState('loading');setLescoErr('');
-    // PITC accepts reference numbers in various formats — try them all until one returns bill data
-    const parts=lescoRef.split('-');
-    const formats=[
-      parts.slice(0,3).join(''),            // "06112240150112"  (14 digits, no letter)
-      parts.join(''),                        // "06112240150112U" (all parts joined)
-      lescoRef.replace(/-/g,''),            // same as above via replace
-      parts.slice(0,3).join('-'),           // "06-11224-0150112" (dashes, no letter)
-      lescoRef,                              // "06-11224-0150112-U" (original full)
-    ];
-    // deduplicate
-    const uniqueFormats=[...new Set(formats)];
-    const isInvalidResponse=(html:string)=>{
-      const u=html.toUpperCase();
-      return u.includes('IS INVALID')||u.includes('NOT VALID')||u.includes('NO RECORD')||u.includes('NOT FOUND')||(u.includes('SEARCH YOUR')||u.includes('ENTER YOUR'))&&!u.includes('AMOUNT PAYABLE');
-    };
-    try{
-      for(const refno of uniqueFormats){
-        const url=`https://bill.pitc.com.pk/lescobill/general?refno=${encodeURIComponent(refno)}`;
-        console.log('[PITC] trying refno='+refno);
-        let res:Response;
-        try{ res=await fetch(url,{headers:{'User-Agent':'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36','Accept':'text/html,*/*'}}); }
-        catch(e){ continue; }
-        if(!res.ok) continue;
-        const html=await res.text();
-        console.log('[PITC] refno='+refno+' len='+html.length+' invalid='+isInvalidResponse(html));
-        if(isInvalidResponse(html)) continue;
-        const upper=html.toUpperCase();
-        if(!upper.includes('AMOUNT')&&!upper.includes('PAYABLE')) continue;
-        // Found valid bill response
-        const data=parsePitcHtml(html);
-        console.log('[PITC] parsed:', JSON.stringify({refno,amt:data.amountWithinDueDate,name:data.customerName,due:data.dueDate}));
-        if(data.amountWithinDueDate){fillLescoData(data);return;}
-        // Parsed but no amount found — show debug
-        setLescoState('error');
-        setLescoErr(`Bill found (ref: ${refno}) but amount not parsed.\nDebug: ${data._debug?.slice(0,200)}`);
-        return;
-      }
-      // All formats failed
-      setLescoState('error');
-      setLescoErr('Reference number not recognised by PITC. Check the number in Settings → Saved Bills → Edit LESCO.');
-    }catch(e:any){setLescoState('error');setLescoErr(`Network error: ${e?.message??'unknown'}. Check your internet connection.`);}
+    // Build PITC URL — try with dashes-stripped numeric refno
+    const parts=lescoRef.replace(/\s/g,'').split('-');
+    const refno=parts.length>=3?parts.slice(0,3).join(''):lescoRef.replace(/[^0-9]/g,'');
+    setLescoWebViewUri(`https://bill.pitc.com.pk/lescobill/general?refno=${refno}`);
   };
 
-  // Legacy stubs — kept so CAPTCHA UI doesn't crash if somehow shown
+  const onLescoWebViewMessage=(event:{nativeEvent:{data:string}})=>{
+    setLescoWebViewUri(null);
+    try{
+      const{text}=JSON.parse(event.nativeEvent.data);
+      console.log('[PITC WebView] text snippet:', text?.slice(0,300));
+      const upper=(text||'').toUpperCase();
+      if(!upper.includes('AMOUNT')&&!upper.includes('PAYABLE')&&!upper.includes('NET')){
+        setLescoState('error');
+        setLescoErr('PITC loaded but no bill data found. Check your reference number in Settings → Saved Bills.');
+        return;
+      }
+      const data=parsePitcText(text||'');
+      if(data.amountWithinDueDate){fillLescoData(data);}
+      else{setLescoState('error');setLescoErr(`Bill found but amount couldn't be read. Text: ${text?.slice(0,150)}`);}
+    }catch(e){setLescoState('error');setLescoErr('Failed to read bill data. Try again.');}
+  };
+
   const lescoCaptchaSubmit=async()=>{ setLescoState('idle'); };
-  const lescoReloadCaptcha=async()=>{ await lescoFetch(); };
+  const lescoReloadCaptcha=()=>{ lescoFetch(); };
 
   const fillLescoData=(data:any)=>{
     if(data.amountWithinDueDate) setAmount(String(data.amountWithinDueDate));
@@ -609,6 +583,19 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
             <TouchableOpacity style={[s.btnP,{margin:16}]} onPress={doSave}><Text style={{color:'white',fontWeight:'700',fontSize:15}}>Save Bill</Text></TouchableOpacity>
           </ScrollView>
         </View>
+      {/* Hidden WebView — loads PITC page with JS, extracts bill data */}
+      {lescoWebViewUri&&(
+        <WebView
+          source={{uri:lescoWebViewUri}}
+          style={{width:0,height:0,opacity:0,position:'absolute'}}
+          injectedJavaScriptBeforeContentLoaded=""
+          injectedJavaScript={LESCO_EXTRACT_JS}
+          onMessage={onLescoWebViewMessage}
+          onError={()=>{setLescoWebViewUri(null);setLescoState('error');setLescoErr("Couldn't load PITC page. Check your internet connection.");}}
+          javaScriptEnabled={true}
+          domStorageEnabled={true}
+        />
+      )}
       </KeyboardAvoidingView>
     </Modal>
   );

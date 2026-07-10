@@ -304,42 +304,54 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
     } else { setLescoRef(null);setLescoState('idle'); }
   };
 
+  // Parse bill amount/details from raw PITC HTML using text scan (no cheerio needed)
+  const parsePitcHtml=(html:string)=>{
+    const txt=html.replace(/<[^>]+>/g,' ').replace(/&nbsp;/gi,' ').replace(/\s+/g,' ');
+    const after=(label:string)=>{
+      const idx=txt.toUpperCase().indexOf(label.toUpperCase());
+      if(idx===-1) return null;
+      return txt.slice(idx+label.length,idx+label.length+120).trim().split(/\s{2,}/)[0].trim()||null;
+    };
+    const parseAmt=(v:string|null)=>parseInt((v||'').replace(/[^0-9]/g,''),10)||0;
+    const get=(...labels:string[])=>{ for(const l of labels){const v=after(l);if(v&&v.length<80)return v;} return null; };
+    return {
+      customerName:        get('CUSTOMER NAME:','CONSUMER NAME:','NAME:')??'Unknown',
+      dueDate:             get('DUE DATE:','LAST DATE:','PAYABLE DATE:')??'Unknown',
+      amountWithinDueDate: parseAmt(get('AMOUNT PAYABLE WITHIN DUE DATE:','WITHIN DUE DATE:','AMOUNT PAYABLE:')),
+      amountAfterDueDate:  parseAmt(get('AMOUNT PAYABLE AFTER DUE DATE:','AFTER DUE DATE:')),
+      lastBillMonth:       get('BILL MONTH:','BILLING MONTH:','MONTH:')??'Unknown',
+    };
+  };
+
   const lescoFetch=async()=>{
     if(!lescoRef) return;
     setLescoState('loading');setLescoErr('');
     try{
-      const capRes=await fetch(`${PROXY_URL}/lesco/captcha?ref=${encodeURIComponent(lescoRef)}`);
-      const capJson=await capRes.json();
-      if(!capJson.success){setLescoState('error');setLescoErr(capJson.message||capJson.error||"Couldn't fetch bill — try again");return;}
-      // PITC path: no CAPTCHA needed, data comes back immediately
-      if(capJson.noCaptchaNeeded&&capJson.data){fillLescoData(capJson.data);return;}
-      // Legacy CAPTCHA path (fallback)
-      setLescoSessionId(capJson.sessionId);setLescoCaptchaImg(capJson.captchaImage);setCaptchaCode('');setLescoState('captcha');
-    }catch(e){setLescoState('error');setLescoErr("Couldn't reach the bill proxy. Check your connection.");}
+      // Call PITC directly from the device — phone has a Pakistani IP so no blocking.
+      // React Native fetch has no CORS restrictions (browser-only concern).
+      const parts=lescoRef.split('-');
+      const refno=parts.slice(0,3).join(''); // "06-11224-0150112-U" → "06112240150112"
+      const res=await fetch(`https://bill.pitc.com.pk/lescobill/general?refno=${refno}`,{
+        headers:{'User-Agent':'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36','Accept':'text/html,*/*'},
+      });
+      if(!res.ok){setLescoState('error');setLescoErr(`PITC returned ${res.status}. Try again later.`);return;}
+      const html=await res.text();
+      const upper=html.toUpperCase();
+      if(upper.includes('NO RECORD')||upper.includes('NOT FOUND')||upper.includes('INVALID REF')){
+        setLescoState('error');setLescoErr('Reference number not found on LESCO. Check the number in your template.');return;
+      }
+      if(!upper.includes('AMOUNT')&&!upper.includes('CUSTOMER')&&!upper.includes('CONSUMER')){
+        setLescoState('error');setLescoErr("Couldn't read bill data. Try again or enter the amount manually.");return;
+      }
+      const data=parsePitcHtml(html);
+      if(!data.amountWithinDueDate){setLescoState('error');setLescoErr("Bill found but couldn't read the amount. Enter it manually.");return;}
+      fillLescoData(data);
+    }catch(e){setLescoState('error');setLescoErr("Couldn't reach PITC bill portal. Check your internet connection.");}
   };
 
-  const lescoCaptchaSubmit=async()=>{
-    if(!captchaCode.trim()) return;
-    setLescoState('loading');
-    try{
-      const res=await fetch(`${PROXY_URL}/lesco/fetch`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ref:lescoRef,captchaCode:captchaCode.trim(),sessionId:lescoSessionId})});
-      const json=await res.json();
-      if(json.success&&json.data){fillLescoData(json.data);}
-      else if(json.error==='incorrect_captcha'){setCaptchaCode('');lescoReloadCaptcha();}
-      else{setLescoState('error');setLescoErr(json.message||"Couldn't retrieve bill data — try again");}
-    }catch(e){setLescoState('error');setLescoErr('Network error — try again');}
-  };
-
-  const lescoReloadCaptcha=async()=>{
-    if(!lescoRef) return;
-    setLescoState('loading');
-    try{
-      const capRes=await fetch(`${PROXY_URL}/lesco/captcha?ref=${encodeURIComponent(lescoRef)}`);
-      const capJson=await capRes.json();
-      if(!capJson.success){setLescoState('error');setLescoErr("Couldn't reload CAPTCHA");return;}
-      setLescoSessionId(capJson.sessionId);setLescoCaptchaImg(capJson.captchaImage);setCaptchaCode('');setLescoState('captcha');
-    }catch(e){setLescoState('error');setLescoErr('Network error');}
-  };
+  // Legacy stubs — kept so CAPTCHA UI doesn't crash if somehow shown
+  const lescoCaptchaSubmit=async()=>{ setLescoState('idle'); };
+  const lescoReloadCaptcha=async()=>{ await lescoFetch(); };
 
   const fillLescoData=(data:any)=>{
     if(data.amountWithinDueDate) setAmount(String(data.amountWithinDueDate));

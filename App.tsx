@@ -360,31 +360,47 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
   const lescoFetch=async()=>{
     if(!lescoRef) return;
     setLescoState('loading');setLescoErr('');
+    // PITC accepts reference numbers in various formats — try them all until one returns bill data
+    const parts=lescoRef.split('-');
+    const formats=[
+      parts.slice(0,3).join(''),            // "06112240150112"  (14 digits, no letter)
+      parts.join(''),                        // "06112240150112U" (all parts joined)
+      lescoRef.replace(/-/g,''),            // same as above via replace
+      parts.slice(0,3).join('-'),           // "06-11224-0150112" (dashes, no letter)
+      lescoRef,                              // "06-11224-0150112-U" (original full)
+    ];
+    // deduplicate
+    const uniqueFormats=[...new Set(formats)];
+    const isInvalidResponse=(html:string)=>{
+      const u=html.toUpperCase();
+      return u.includes('IS INVALID')||u.includes('NOT VALID')||u.includes('NO RECORD')||u.includes('NOT FOUND')||(u.includes('SEARCH YOUR')||u.includes('ENTER YOUR'))&&!u.includes('AMOUNT PAYABLE');
+    };
     try{
-      const parts=lescoRef.split('-');
-      const refno=parts.slice(0,3).join('');
-      const res=await fetch(`https://bill.pitc.com.pk/lescobill/general?refno=${refno}`,{
-        headers:{'User-Agent':'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36','Accept':'text/html,*/*'},
-      });
-      if(!res.ok){setLescoState('error');setLescoErr(`PITC returned HTTP ${res.status}. Try again later.`);return;}
-      const html=await res.text();
-      const upper=html.toUpperCase();
-      if(upper.includes('NO RECORD')||upper.includes('NOT FOUND')||upper.includes('INVALID REF')){
-        setLescoState('error');setLescoErr('Reference number not found on LESCO. Check the number in your template.');return;
-      }
-      if(!upper.includes('AMOUNT')&&!upper.includes('CUSTOMER')&&!upper.includes('CONSUMER')){
-        setLescoState('error');setLescoErr("Couldn't read bill data. Try again or enter the amount manually.");return;
-      }
-      const data=parsePitcHtml(html);
-      console.log('[PITC] parsed:', JSON.stringify({amt:data.amountWithinDueDate,name:data.customerName,due:data.dueDate,debug:data._debug}));
-      if(!data.amountWithinDueDate){
-        // Show debug snippet so we can fix the parser
+      for(const refno of uniqueFormats){
+        const url=`https://bill.pitc.com.pk/lescobill/general?refno=${encodeURIComponent(refno)}`;
+        console.log('[PITC] trying refno='+refno);
+        let res:Response;
+        try{ res=await fetch(url,{headers:{'User-Agent':'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36','Accept':'text/html,*/*'}}); }
+        catch(e){ continue; }
+        if(!res.ok) continue;
+        const html=await res.text();
+        console.log('[PITC] refno='+refno+' len='+html.length+' invalid='+isInvalidResponse(html));
+        if(isInvalidResponse(html)) continue;
+        const upper=html.toUpperCase();
+        if(!upper.includes('AMOUNT')&&!upper.includes('PAYABLE')) continue;
+        // Found valid bill response
+        const data=parsePitcHtml(html);
+        console.log('[PITC] parsed:', JSON.stringify({refno,amt:data.amountWithinDueDate,name:data.customerName,due:data.dueDate}));
+        if(data.amountWithinDueDate){fillLescoData(data);return;}
+        // Parsed but no amount found — show debug
         setLescoState('error');
-        setLescoErr(`Amount label not found. Share this with support:\n${data._debug}`);
+        setLescoErr(`Bill found (ref: ${refno}) but amount not parsed.\nDebug: ${data._debug?.slice(0,200)}`);
         return;
       }
-      fillLescoData(data);
-    }catch(e:any){setLescoState('error');setLescoErr(`Network error: ${e?.message??'unknown'}. Check your internet.`);}
+      // All formats failed
+      setLescoState('error');
+      setLescoErr('Reference number not recognised by PITC. Check the number in Settings → Saved Bills → Edit LESCO.');
+    }catch(e:any){setLescoState('error');setLescoErr(`Network error: ${e?.message??'unknown'}. Check your internet connection.`);}
   };
 
   // Legacy stubs — kept so CAPTCHA UI doesn't crash if somehow shown
@@ -1210,7 +1226,7 @@ function AppContent() {
 
   useEffect(()=>{
     (async()=>{
-      if(Platform.OS==='android'){ try{ await NavigationBar.setPositionAsync('absolute'); await NavigationBar.setBackgroundColorAsync('rgba(0,0,0,0)'); await NavigationBar.setButtonStyleAsync('light'); }catch{} }
+      if(Platform.OS==='android'){ try{await NavigationBar.setPositionAsync('absolute');}catch{} try{await NavigationBar.setBackgroundColorAsync('rgba(0,0,0,0)');}catch{} try{await NavigationBar.setButtonStyleAsync('light');}catch{} }
       await ensureNotifChannel();
       Notifications.requestPermissionsAsync().catch(()=>{});
       const{data:{session}}=await supabase.auth.getSession();

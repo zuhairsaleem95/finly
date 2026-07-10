@@ -306,7 +306,9 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
 
   // Parse bill amount/details from raw PITC HTML using text scan (no cheerio needed)
   const parsePitcHtml=(html:string)=>{
-    const txt=html.replace(/<[^>]+>/g,' ').replace(/&nbsp;/gi,' ').replace(/&#[0-9]+;/g,' ').replace(/\s+/g,' ');
+    // Strip script/style blocks entirely so their content doesn't pollute the text scan
+    const stripped=html.replace(/<script[\s\S]*?<\/script>/gi,' ').replace(/<style[\s\S]*?<\/style>/gi,' ');
+    const txt=stripped.replace(/<[^>]+>/g,' ').replace(/&nbsp;/gi,' ').replace(/&#[0-9]+;/g,' ').replace(/\s+/g,' ');
     const after=(label:string)=>{
       const idx=txt.toUpperCase().indexOf(label.toUpperCase());
       if(idx===-1) return null;
@@ -339,10 +341,10 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
         if(n>=100){amountWithinDueDate=n;break;}
       }
     }
-    // Last resort: grab all 4-6 digit standalone numbers, take the first
+    // Last resort: grab standalone numbers ≥ 500 (no electricity bill is under Rs 500)
     if(!amountWithinDueDate){
-      const nums=txt.match(/\b([0-9]{4,7})\b/g)??[];
-      if(nums.length) amountWithinDueDate=parseInt(nums[0],10)||0;
+      const nums=txt.match(/\b([0-9]{3,7})\b/g)??[];
+      for(const n of nums){const v=parseInt(n,10);if(v>=500&&v<=999999){amountWithinDueDate=v;break;}}
     }
 
     return {
@@ -374,6 +376,7 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
         setLescoState('error');setLescoErr("Couldn't read bill data. Try again or enter the amount manually.");return;
       }
       const data=parsePitcHtml(html);
+      console.log('[PITC] parsed:', JSON.stringify({amt:data.amountWithinDueDate,name:data.customerName,due:data.dueDate,debug:data._debug}));
       if(!data.amountWithinDueDate){
         // Show debug snippet so we can fix the parser
         setLescoState('error');

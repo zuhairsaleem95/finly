@@ -306,7 +306,7 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
 
   // Parse bill amount/details from raw PITC HTML using text scan (no cheerio needed)
   const parsePitcHtml=(html:string)=>{
-    const txt=html.replace(/<[^>]+>/g,' ').replace(/&nbsp;/gi,' ').replace(/\s+/g,' ');
+    const txt=html.replace(/<[^>]+>/g,' ').replace(/&nbsp;/gi,' ').replace(/&#[0-9]+;/g,' ').replace(/\s+/g,' ');
     const after=(label:string)=>{
       const idx=txt.toUpperCase().indexOf(label.toUpperCase());
       if(idx===-1) return null;
@@ -314,12 +314,44 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
     };
     const parseAmt=(v:string|null)=>parseInt((v||'').replace(/[^0-9]/g,''),10)||0;
     const get=(...labels:string[])=>{ for(const l of labels){const v=after(l);if(v&&v.length<80)return v;} return null; };
+
+    // Try all known PITC/LESCO label variants for the payable amount
+    const amtRaw=get(
+      'AMOUNT PAYABLE WITHIN DUE DATE:','AMOUNT PAYABLE WITHIN DUE DATE',
+      'WITHIN DUE DATE:','WITHIN DUE DATE',
+      'PAYABLE WITHIN DUE DATE:','PAYABLE WITHIN DUE DATE',
+      'AMOUNT PAYABLE:','AMOUNT PAYABLE',
+      'NET PAYABLE:','NET PAYABLE',
+      'NET AMOUNT:','NET AMOUNT',
+      'TOTAL PAYABLE:','TOTAL PAYABLE',
+      'TOTAL AMOUNT:','TOTAL AMOUNT',
+      'AMOUNT DUE:','AMOUNT DUE',
+      'PAYABLE AMOUNT:','PAYABLE AMOUNT',
+      'DUE AMOUNT:','DUE AMOUNT',
+    );
+    let amountWithinDueDate=parseAmt(amtRaw);
+
+    // Fallback: scan for any Rs / PKR followed by a number, take the first one ≥ 100
+    if(!amountWithinDueDate){
+      const rsMatches=txt.match(/(?:RS|PKR)\.?\s*([0-9,]+)/gi)??[];
+      for(const m of rsMatches){
+        const n=parseAmt(m);
+        if(n>=100){amountWithinDueDate=n;break;}
+      }
+    }
+    // Last resort: grab all 4-6 digit standalone numbers, take the first
+    if(!amountWithinDueDate){
+      const nums=txt.match(/\b([0-9]{4,7})\b/g)??[];
+      if(nums.length) amountWithinDueDate=parseInt(nums[0],10)||0;
+    }
+
     return {
-      customerName:        get('CUSTOMER NAME:','CONSUMER NAME:','NAME:')??'Unknown',
-      dueDate:             get('DUE DATE:','LAST DATE:','PAYABLE DATE:')??'Unknown',
-      amountWithinDueDate: parseAmt(get('AMOUNT PAYABLE WITHIN DUE DATE:','WITHIN DUE DATE:','AMOUNT PAYABLE:')),
-      amountAfterDueDate:  parseAmt(get('AMOUNT PAYABLE AFTER DUE DATE:','AFTER DUE DATE:')),
-      lastBillMonth:       get('BILL MONTH:','BILLING MONTH:','MONTH:')??'Unknown',
+      customerName:        get('CUSTOMER NAME:','CUSTOMER NAME','CONSUMER NAME:','CONSUMER NAME','NAME:')??'Unknown',
+      dueDate:             get('DUE DATE:','DUE DATE','LAST DATE:','LAST DATE','PAYABLE DATE:','PAYMENT DUE DATE:')??'Unknown',
+      amountWithinDueDate,
+      amountAfterDueDate:  parseAmt(get('AMOUNT PAYABLE AFTER DUE DATE:','AFTER DUE DATE:','AFTER DUE DATE','AMOUNT AFTER DUE DATE:')),
+      lastBillMonth:       get('BILL MONTH:','BILLING MONTH:','BILLING MONTH','MONTH:','BILL PERIOD:')??'Unknown',
+      _debug: txt.slice(0,400), // temporary — helps diagnose label mismatches
     };
   };
 
@@ -327,14 +359,12 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
     if(!lescoRef) return;
     setLescoState('loading');setLescoErr('');
     try{
-      // Call PITC directly from the device — phone has a Pakistani IP so no blocking.
-      // React Native fetch has no CORS restrictions (browser-only concern).
       const parts=lescoRef.split('-');
-      const refno=parts.slice(0,3).join(''); // "06-11224-0150112-U" → "06112240150112"
+      const refno=parts.slice(0,3).join('');
       const res=await fetch(`https://bill.pitc.com.pk/lescobill/general?refno=${refno}`,{
         headers:{'User-Agent':'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36','Accept':'text/html,*/*'},
       });
-      if(!res.ok){setLescoState('error');setLescoErr(`PITC returned ${res.status}. Try again later.`);return;}
+      if(!res.ok){setLescoState('error');setLescoErr(`PITC returned HTTP ${res.status}. Try again later.`);return;}
       const html=await res.text();
       const upper=html.toUpperCase();
       if(upper.includes('NO RECORD')||upper.includes('NOT FOUND')||upper.includes('INVALID REF')){
@@ -344,9 +374,14 @@ function AddSheet({visible,members,templates,onClose,onSave,onEditTemplates}:{vi
         setLescoState('error');setLescoErr("Couldn't read bill data. Try again or enter the amount manually.");return;
       }
       const data=parsePitcHtml(html);
-      if(!data.amountWithinDueDate){setLescoState('error');setLescoErr("Bill found but couldn't read the amount. Enter it manually.");return;}
+      if(!data.amountWithinDueDate){
+        // Show debug snippet so we can fix the parser
+        setLescoState('error');
+        setLescoErr(`Amount label not found. Share this with support:\n${data._debug}`);
+        return;
+      }
       fillLescoData(data);
-    }catch(e){setLescoState('error');setLescoErr("Couldn't reach PITC bill portal. Check your internet connection.");}
+    }catch(e:any){setLescoState('error');setLescoErr(`Network error: ${e?.message??'unknown'}. Check your internet.`);}
   };
 
   // Legacy stubs — kept so CAPTCHA UI doesn't crash if somehow shown
